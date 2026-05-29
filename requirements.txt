@@ -1,0 +1,8 @@
+streamlit>=1.35.0
+langchain>=0.2.0
+langchain-community>=0.2.0
+langchain-experimental>=0.0.60
+langchain-groq>=0.1.0
+faiss-cpu>=1.8.0
+youtube-transcript-api>=0.6.2
+requests>=2.31.0
