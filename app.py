@@ -10,6 +10,7 @@ from langchain_experimental.text_splitter import SemanticChunker
 from langchain_community.vectorstores import FAISS
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_groq import ChatGroq
+import requests  # for Jina reranker API
 
 # ─────────────────────────────────────────────
 # PAGE CONFIG
@@ -32,70 +33,54 @@ def _secret(key: str) -> str:
 GROQ_API_KEY    = _secret("GROQ_API_KEY")
 JINA_API_KEY    = _secret("JINA_API_KEY")
 FAISS_CACHE_DIR = "faiss_cache"
+TOP_K_RETRIEVE  = 15
+TOP_K_RERANK    = 5
 
-# ── Retrieval settings ────────────────────────
-# TOP_K_RETRIEVE: how many chunks MMR fetches before reranking
-# TOP_K_RERANK:   how many of those we keep for the LLM context
-# Increasing TOP_K_RETRIEVE gives the reranker more to choose from.
-TOP_K_RETRIEVE = 15
-TOP_K_RERANK   = 5     # more context → better answers for broad questions
+# ── Proxy config (Streamlit Cloud only) ──────────────────────────────────────
+# Streamlit Cloud servers are in the US. Some YouTube videos are geo-blocked
+# there even if they work fine locally (India).
+# To fix: Settings → Secrets → add:  PROXY_URL = "http://user:pass@host:port"
+# Recommended: webshare.io (10 free proxies, works well from India videos)
+# Leave absent / empty to use no proxy (default for local runs).
+# ─────────────────────────────────────────────────────────────────────────────
+PROXY_URL = _secret("PROXY_URL")   # empty string when not set
 
 SYSTEM_PROMPT = """
-You are a helpful YouTube video assistant.
+You are an intelligent YouTube video assistant. You have watched the video
+and have access to the most relevant transcript excerpts as context.
 
-The user will ask questions about a YouTube video. You are given transcript excerpts from the video, each with timestamps.
+Answer using this priority order:
 
-Rules:
+TIER 1 — VIDEO CONTEXT (highest priority):
+  If the transcript context directly answers the question, use it.
+  Reference timestamps naturally (e.g. "Around 3:56 the speaker explains...").
+  For summary questions ("what is the video about"), synthesise across ALL sources.
 
-1. First determine whether the user's question can be answered from the provided transcript context.
+TIER 2 — GENERAL KNOWLEDGE (fill the gaps):
+  If the question asks for a definition, background concept, or explanation
+  of a term that the transcript mentions but does not fully explain —
+  answer from your general knowledge AND connect it to the video context.
+  Example: video is about RAG and user asks "what is an embedding?" →
+  explain embeddings from general knowledge, then tie it to how the video uses them.
 
-2. If the answer is present in the transcript:
+TIER 3 — HONEST LIMITATION:
+  Only say you cannot answer if the question is completely unrelated to both
+  the video topic AND general knowledge (e.g. asking about a private detail
+  that only the speaker would know).
 
-   * Answer using ONLY the transcript information.
-   * Reference relevant timestamps naturally.
-   * Do not add outside knowledge.
-   * Start the response with:
-     "[From Video]"
-
-3. If the transcript is insufficient to answer the question:
-
-   * State that the information is not discussed in the provided video excerpts.
-   * Then answer using general knowledge if you know the answer.
-   * Clearly separate this information by starting with:
-     "[General Knowledge]"
-
-4. If the transcript is insufficient and you do not know the answer:
-
-   * Respond:
-     "I could not find enough information in the video to answer this, and I do not have sufficient general knowledge to answer reliably."
-
-5. Never claim information came from the video unless it is supported by the provided transcript.
-
-6. When answering from the video:
-
-   * Be detailed and clear.
-   * Cite timestamps when relevant.
-   * Combine information from multiple transcript excerpts if needed.
-
-Examples:
-
-Question: "What does the speaker say about coalition governments?"
-Response:
-[From Video]
-Around 12:15 the speaker explains that coalition governments...
-
-Question: "Where is India located?"
-Response:
-The provided video excerpts do not discuss India's geographic location.
-
-[General Knowledge]
-India is located in South Asia and shares borders with Pakistan, China, Nepal, Bhutan, Bangladesh, and Myanmar.
-
+Style rules:
+- Be detailed, clear, and helpful.
+- Always prefer answering over refusing.
+- Never say "the transcript does not provide" as a full answer — if the
+  transcript is thin, supplement with general knowledge.
+- Keep answers focused on what would genuinely help someone who just watched
+  this video.
 """.strip()
 
 # ─────────────────────────────────────────────
-# CACHED RESOURCES  (API clients only — no downloads)
+# CACHED RESOURCES
 # ─────────────────────────────────────────────
+
 @st.cache_resource(show_spinner=False)
 def load_embeddings():
     return JinaEmbeddings(
@@ -105,47 +90,68 @@ def load_embeddings():
 
 @st.cache_resource(show_spinner=False)
 def load_llm():
-    return ChatGroq(groq_api_key=GROQ_API_KEY, model_name="llama-3.3-70b-versatile")
-    # Using llama3-70b for significantly better answer quality.
-    # If you hit rate limits switch back to llama3-8b-8192.
+    # llama3-70b gives much better answers than 8b.
+    # If you hit Groq rate limits, switch to "llama3-8b-8192".
+    return ChatGroq(groq_api_key=GROQ_API_KEY,model="llama-3.3-70b-versatile")
+
+# No reranker resource to load — Jina Reranker v2 is a pure API call.
+# Zero download. Zero cold-start delay. Better quality than BGE-base.
 
 # ─────────────────────────────────────────────
-# RERANKER  — pure Python, no model download
-# Scores each (query, chunk) pair by counting query-word overlaps
-# weighted by chunk length. Good enough to improve ordering with
-# zero latency and zero external calls.
+# RERANKING  (BGE or lexical fallback)
 # ─────────────────────────────────────────────
-def simple_rerank(query: str, docs: list, top_n: int = 5) -> list:
+
+def rerank(query: str, docs: list, top_n: int) -> list:
     """
-    Lightweight lexical reranker.
-    Scores each doc by how many unique query words appear in it,
-    normalised by doc length so shorter noisy chunks don't win.
-    Falls back to original order on any error.
+    Jina Reranker v2 — pure API call, zero local model download.
+    Model: jina-reranker-v2-base-multilingual
+    - Supports 100+ languages including Hindi, Telugu, English
+    - Better quality than BGE-base
+    - Works identically locally and on Streamlit Cloud
+    Falls back to lexical scoring if the API call fails.
     """
     if not docs:
         return docs
+
     try:
-        q_words = set(re.findall(r"\w+", query.lower()))
-        scored = []
-        for doc in docs:
-            text  = doc.page_content.lower()
-            words = re.findall(r"\w+", text)
-            if not words:
-                scored.append((0.0, doc))
-                continue
-            # TF-style: hits / total_words, boosted by unique hits
-            hits        = sum(1 for w in words if w in q_words)
-            unique_hits = len(set(words) & q_words)
-            score = (hits / len(words)) + (unique_hits * 0.1)
-            scored.append((score, doc))
-        scored.sort(key=lambda x: x[0], reverse=True)
-        return [doc for _, doc in scored[:top_n]]
+        resp = requests.post(
+            "https://api.jina.ai/v1/rerank",
+            headers={
+                "Authorization": f"Bearer {JINA_API_KEY}",
+                "Content-Type":  "application/json",
+            },
+            json={
+                "model":     "jina-reranker-v2-base-multilingual",
+                "query":     query,
+                "documents": [d.page_content for d in docs],
+                "top_n":     top_n,
+            },
+            timeout=15,
+        )
+        if resp.status_code == 200:
+            results = resp.json().get("results", [])
+            # Each result: {"index": int, "relevance_score": float, ...}
+            ranked = sorted(results, key=lambda x: x["relevance_score"], reverse=True)
+            return [docs[r["index"]] for r in ranked[:top_n]]
     except Exception:
-        return docs[:top_n]
+        pass
+
+    # Lexical fallback — never breaks the app
+    q_words = set(re.findall(r"\w+", query.lower()))
+    scored  = []
+    for doc in docs:
+        words       = re.findall(r"\w+", doc.page_content.lower())
+        hits        = sum(1 for w in words if w in q_words)
+        unique_hits = len(set(words) & q_words)
+        score       = (hits / max(len(words), 1)) + unique_hits * 0.1
+        scored.append((score, doc))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [doc for _, doc in scored[:top_n]]
 
 # ─────────────────────────────────────────────
 # HELPERS
 # ─────────────────────────────────────────────
+
 def extract_video_id(url: str) -> str | None:
     patterns = [
         r"(?:v=|\/)([0-9A-Za-z_-]{11}).*",
@@ -165,17 +171,10 @@ def seconds_to_mmss(seconds: int) -> str:
     return f"{m}:{s:02d}"
 
 # ─────────────────────────────────────────────
-# YOUTUBE PLAYER
-# The player and the seek buttons live in THE SAME components.html()
-# call so postMessage works within one iframe — no cross-frame issue.
-# We rebuild this single block every time seek_to changes.
+# YOUTUBE PLAYER  (player + seek buttons in one iframe)
 # ─────────────────────────────────────────────
+
 def render_player_with_buttons(video_id: str, sources: list, start_seconds: int = 0):
-    """
-    Renders the YouTube player AND all timestamp buttons inside one
-    self-contained iframe. Because everything shares the same window,
-    postMessage works perfectly without any cross-frame permission issues.
-    """
     buttons_html = ""
     for src in sources:
         s     = int(src["start"])
@@ -190,29 +189,21 @@ def render_player_with_buttons(video_id: str, sources: list, start_seconds: int 
           ▶ {label}
         </button>"""
 
-    html = f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
+    html = f"""<!DOCTYPE html><html><head>
     <style>
       body {{ margin:0; padding:0; background:#0e1117; font-family:sans-serif; }}
       #player-wrap {{ width:100%; aspect-ratio:16/9; border-radius:10px; overflow:hidden; background:#000; }}
-      #yt-player {{ width:100%; height:100%; }}
       #btn-row {{ padding:8px 0 4px; }}
       .btn-label {{ font-size:11px; color:#64748b; margin-bottom:4px; }}
     </style>
-    </head>
-    <body>
+    </head><body>
       <div id="player-wrap"><div id="yt-player"></div></div>
       <div id="btn-row">
         <div class="btn-label">⏩ Jump to timestamp:</div>
-        {buttons_html if buttons_html else '<span style="color:#64748b;font-size:12px">No timestamps yet</span>'}
+        {buttons_html if buttons_html else '<span style="color:#64748b;font-size:12px">Ask a question to see timestamps</span>'}
       </div>
-
       <script>
         var player;
-        var pendingSeek = {start_seconds};
-
         var tag = document.createElement('script');
         tag.src = 'https://www.youtube.com/iframe_api';
         document.head.appendChild(tag);
@@ -220,17 +211,10 @@ def render_player_with_buttons(video_id: str, sources: list, start_seconds: int 
         function onYouTubeIframeAPIReady() {{
           player = new YT.Player('yt-player', {{
             videoId: '{video_id}',
-            playerVars: {{
-              autoplay: 0,
-              rel: 0,
-              modestbranding: 1,
-              start: {start_seconds}
-            }},
+            playerVars: {{ autoplay:0, rel:0, modestbranding:1, start:{start_seconds} }},
             events: {{
               onReady: function(e) {{
-                if (pendingSeek > 0) {{
-                  e.target.seekTo(pendingSeek, true);
-                }}
+                if ({start_seconds} > 0) e.target.seekTo({start_seconds}, true);
               }}
             }}
           }});
@@ -240,34 +224,19 @@ def render_player_with_buttons(video_id: str, sources: list, start_seconds: int 
           if (player && player.seekTo) {{
             player.seekTo(seconds, true);
             player.playVideo();
-            document.getElementById('player-wrap').scrollIntoView({{behavior:'smooth'}});
           }}
         }}
       </script>
-    </body>
-    </html>
-    """
-    # height: 56.25% of width for 16:9 + ~70px for button row
+    </body></html>"""
     components.html(html, height=500, scrolling=False)
 
 # ─────────────────────────────────────────────
 # TRANSCRIPT PIPELINE
 # ─────────────────────────────────────────────
-def fetch_transcript(video_id: str) -> tuple[list[dict], str]:
-    api             = YouTubeTranscriptApi()
-    transcript_list = api.list(video_id)
-    try:
-        t    = transcript_list.find_transcript(["en"])
-        lang = "en"
-    except Exception:
-        t    = transcript_list.find_transcript(
-            [x.language_code for x in transcript_list]
-        )
-        lang = t.language_code
-        if lang != "en":
-            t = t.translate("en")
-    raw = t.fetch()
-    segments = [
+
+def _segments_from_raw(raw) -> list[dict]:
+    """Normalise raw transcript snippets to plain dicts."""
+    return [
         {
             "text":     s.text     if hasattr(s, "text")     else s["text"],
             "start":    s.start    if hasattr(s, "start")    else s["start"],
@@ -275,6 +244,91 @@ def fetch_transcript(video_id: str) -> tuple[list[dict], str]:
         }
         for s in raw
     ]
+
+
+def _make_api() -> YouTubeTranscriptApi:
+    """
+    Return a YouTubeTranscriptApi instance.
+    On Streamlit Cloud, routes requests through PROXY_URL (if set) to bypass
+    geo-restrictions.  Locally PROXY_URL is empty so no proxy is used.
+    """
+    if PROXY_URL:
+        # webshare / any HTTP proxy in format http://user:pass@host:port
+        return YouTubeTranscriptApi(
+            proxies={"http": PROXY_URL, "https": PROXY_URL}
+        )
+    return YouTubeTranscriptApi()
+
+
+def fetch_transcript(video_id: str) -> tuple[list[dict], str]:
+    """
+    Fetch transcript with clear, user-friendly errors for every failure mode:
+    - geo-blocked video  (fixed via proxy on Streamlit Cloud)
+    - no transcript available
+    - transcripts disabled by uploader
+    - private / deleted video
+    """
+    from youtube_transcript_api._errors import (
+        TranscriptsDisabled,
+        NoTranscriptFound,
+        VideoUnavailable,
+    )
+
+    try:
+        api             = _make_api()
+        transcript_list = api.list(video_id)
+    except VideoUnavailable:
+        raise ValueError(
+            "❌ This video is unavailable (private, deleted, or geo-blocked). "
+            "If deploying on Streamlit Cloud, add a PROXY_URL secret."
+        )
+    except TranscriptsDisabled:
+        raise ValueError(
+            "❌ The uploader has disabled transcripts for this video. "
+            "Try a video that has captions enabled."
+        )
+    except Exception as e:
+        err = str(e).lower()
+        if "country" in err or "not available" in err or "unplayable" in err:
+            raise ValueError(
+                "❌ This video is geo-restricted on the server. "
+                "Add a PROXY_URL to your Streamlit secrets to bypass this. "
+                "See README for setup instructions."
+            )
+        raise ValueError(f"❌ Could not access this video: {e}")
+
+    # Try English first, then any language → translate
+    try:
+        t    = transcript_list.find_transcript(["en"])
+        lang = "en"
+    except NoTranscriptFound:
+        try:
+            available = [x.language_code for x in transcript_list]
+            t    = transcript_list.find_transcript(available)
+            lang = t.language_code
+            if lang != "en":
+                t = t.translate("en")
+                lang = f"{lang}→en"
+        except Exception as e:
+            raise ValueError(
+                f"❌ No usable transcript found for this video. "
+                f"It may not have captions. ({e})"
+            )
+    except Exception as e:
+        raise ValueError(f"❌ Transcript error: {e}")
+
+    try:
+        raw = t.fetch()
+    except Exception as e:
+        raise ValueError(
+            f"❌ Transcript exists but could not be fetched. "
+            f"This sometimes happens with auto-generated captions. ({e})"
+        )
+
+    segments = _segments_from_raw(raw)
+    if not segments:
+        raise ValueError("❌ Transcript was empty. Try a different video.")
+
     return segments, lang
 
 
@@ -285,10 +339,6 @@ def clean_text(text: str) -> str:
 
 
 def merge_windows(segments: list[dict], window_size: int = 20) -> list[dict]:
-    """
-    Merge subtitle lines into overlapping paragraph-like windows.
-    Larger window_size = more context per chunk = better semantic retrieval.
-    """
     step, merged = window_size // 2, []
     for i in range(0, len(segments), step):
         chunk = segments[i : i + window_size]
@@ -321,8 +371,7 @@ def semantic_split(windows: list[dict], embeddings) -> list[dict]:
 
 def build_documents(chunks: list[dict], video_id: str) -> list[Document]:
     splitter = RecursiveCharacterTextSplitter(
-        chunk_size=700,
-        chunk_overlap=150,   # higher overlap = better context continuity
+        chunk_size=700, chunk_overlap=150,
         separators=["\n\n", "\n", ". ", " ", ""],
     )
     docs = []
@@ -339,9 +388,7 @@ def build_or_load_vectorstore(docs: list[Document], video_id: str):
     cache_path = os.path.join(FAISS_CACHE_DIR, video_id)
     embeddings = load_embeddings()
     if os.path.exists(cache_path):
-        vs = FAISS.load_local(
-            cache_path, embeddings, allow_dangerous_deserialization=True
-        )
+        vs = FAISS.load_local(cache_path, embeddings, allow_dangerous_deserialization=True)
         return vs, True
     vs = FAISS.from_documents(docs, embeddings)
     os.makedirs(cache_path, exist_ok=True)
@@ -351,6 +398,7 @@ def build_or_load_vectorstore(docs: list[Document], video_id: str):
 # ─────────────────────────────────────────────
 # FULL INGESTION PIPELINE
 # ─────────────────────────────────────────────
+
 def process_video(url: str, progress_bar, status_text):
     video_id = extract_video_id(url)
     if not video_id:
@@ -359,13 +407,10 @@ def process_video(url: str, progress_bar, status_text):
     embeddings = load_embeddings()
     cache_path = os.path.join(FAISS_CACHE_DIR, video_id)
 
-    # ── Fast path: FAISS cache hit ────────────
     if os.path.exists(cache_path):
         status_text.text("💾 Loading from cache…")
         progress_bar.progress(70)
-        vs = FAISS.load_local(
-            cache_path, embeddings, allow_dangerous_deserialization=True
-        )
+        vs = FAISS.load_local(cache_path, embeddings, allow_dangerous_deserialization=True)
         retriever = vs.as_retriever(
             search_type="mmr",
             search_kwargs={"k": TOP_K_RETRIEVE, "fetch_k": 40, "lambda_mult": 0.7},
@@ -374,7 +419,6 @@ def process_video(url: str, progress_bar, status_text):
         status_text.text("✅ Loaded from cache!")
         return retriever, video_id, vs.index.ntotal, True, "en (cached)"
 
-    # ── Slow path: fresh processing ───────────
     status_text.text("📥 Step 1/5 — Fetching transcript…")
     progress_bar.progress(5)
     segments, lang = fetch_transcript(video_id)
@@ -406,16 +450,43 @@ def process_video(url: str, progress_bar, status_text):
 # ─────────────────────────────────────────────
 # RAG QUERY PIPELINE
 # ─────────────────────────────────────────────
+
+# ── Query type classifier ─────────────────────────────────────────────────────
+# Detects whether a query is asking about the video specifically or is a
+# general/definitional question. Used to tune retrieval aggressiveness.
+
+_SUMMARY_PATTERNS = re.compile(
+    r"\b(what is (the |this )?video|summarize|overview|about this video|"
+    r"what does (the |this )?video|explain (the |this )?video|"
+    r"what (topics?|subjects?) (does|is)|tell me about (the |this )?video)\b",
+    re.IGNORECASE,
+)
+
+_DEFINITION_PATTERNS = re.compile(
+    r"\b(what is|what are|define|explain|meaning of|definition of|"
+    r"how does .+ work|what do you mean by|what does .+ mean)\b",
+    re.IGNORECASE,
+)
+
+def _classify_query(query: str) -> str:
+    """Returns 'summary', 'definition', or 'specific'."""
+    if _SUMMARY_PATTERNS.search(query):
+        return "summary"
+    if _DEFINITION_PATTERNS.search(query):
+        return "definition"
+    return "specific"
+
+
 def answer_question(query: str, retriever, video_id: str) -> dict:
-    llm = load_llm()
+    llm        = load_llm()
+    query_type = _classify_query(query)
 
-    # Step 1: MMR retrieval — diverse set of candidate chunks
+    # For summary questions retrieve more chunks for broader coverage
+    k = TOP_K_RERANK + 3 if query_type == "summary" else TOP_K_RERANK
+
     retrieved_docs = retriever.invoke(query)
+    top_docs       = rerank(query, retrieved_docs, top_n=k)
 
-    # Step 2: Lightweight rerank — push most relevant chunks to top
-    top_docs = simple_rerank(query, retrieved_docs, top_n=TOP_K_RERANK)
-
-    # Step 3: Build rich context block for the LLM
     context = ""
     for i, doc in enumerate(top_docs):
         start   = int(doc.metadata["start"])
@@ -426,13 +497,18 @@ def answer_question(query: str, retriever, video_id: str) -> dict:
             f"{doc.page_content}\n"
         )
 
+    # Add a query-type hint so the LLM knows which tier to use
+    type_hint = {
+        "summary":    "\n[This is a SUMMARY question — synthesise across all sources.]",
+        "definition": "\n[This is a DEFINITION/CONCEPT question — use video context first, then general knowledge if needed.]",
+        "specific":   "",
+    }[query_type]
+
     prompt = (
         f"{SYSTEM_PROMPT}\n\n"
-        f"=== TRANSCRIPT CONTEXT ===\n{context}\n"
-        f"=== END CONTEXT ===\n\n"
+        f"=== TRANSCRIPT CONTEXT ===\n{context}\n=== END CONTEXT ==={type_hint}\n\n"
         f"Question: {query}\n\nAnswer:"
     )
-
     response = llm.invoke(prompt)
 
     sources = [
@@ -455,7 +531,7 @@ for key, default in {
     "detected_lang": "—",
     "messages":      [],
     "show_player":   False,
-    "last_sources":  [],     # sources from the most recent answer
+    "last_sources":  [],
 }.items():
     if key not in st.session_state:
         st.session_state[key] = default
@@ -507,9 +583,13 @@ with st.sidebar:
                     st.session_state.show_player   = True
                     st.rerun()
                 except ValueError as e:
+                    prog_bar.empty()
+                    status_text.empty()
                     st.error(str(e))
                 except Exception as e:
-                    st.error(f"Error: {e}")
+                    prog_bar.empty()
+                    status_text.empty()
+                    st.error(f"❌ Unexpected error: {e}")
 
     st.divider()
 
@@ -540,27 +620,22 @@ if not st.session_state.retriever:
     st.info("👈 Paste a YouTube URL in the sidebar and click **Process video** to begin.")
     st.stop()
 
-# ── Player (self-contained iframe with seek buttons) ──
 if st.session_state.show_player:
     render_player_with_buttons(
         st.session_state.video_id,
-        st.session_state.last_sources,   # buttons for most recent answer
+        st.session_state.last_sources,
         start_seconds=0,
     )
     st.divider()
 
-# ── Chat history (text only, no buttons — buttons live in player) ──
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
-        # Show small timestamp links as plain text under assistant messages
         if msg["role"] == "assistant" and msg.get("sources"):
             cols = st.columns(len(msg["sources"]))
             for col, src in zip(cols, msg["sources"]):
-                ts = seconds_to_mmss(src["start"])
-                col.markdown(f"[⏱ {ts}]({src['link']})")
+                col.markdown(f"[⏱ {seconds_to_mmss(src['start'])}]({src['link']})")
 
-# ── Chat input ────────────────────────────────
 query = st.chat_input("Ask a question about the video…")
 
 if query:
@@ -579,17 +654,12 @@ if query:
         if result["sources"]:
             cols = st.columns(len(result["sources"]))
             for col, src in zip(cols, result["sources"]):
-                ts = seconds_to_mmss(src["start"])
-                col.markdown(f"[⏱ {ts}]({src['link']})")
+                col.markdown(f"[⏱ {seconds_to_mmss(src['start'])}]({src['link']})")
 
-    # Update last_sources so the player shows the new seek buttons
     st.session_state.last_sources = result["sources"]
-
     st.session_state.messages.append({
         "role":    "assistant",
         "content": result["answer"],
         "sources": result["sources"],
     })
-
-    # Rerun so the player iframe rebuilds with updated seek buttons
     st.rerun()
