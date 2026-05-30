@@ -92,7 +92,7 @@ def load_embeddings():
 def load_llm():
     # llama3-70b gives much better answers than 8b.
     # If you hit Groq rate limits, switch to "llama3-8b-8192".
-    return ChatGroq(groq_api_key=GROQ_API_KEY,model="llama-3.3-70b-versatile")
+    return ChatGroq(groq_api_key=GROQ_API_KEY, model="llama-3.3-70b-versatile")
 
 # No reranker resource to load — Jina Reranker v2 is a pure API call.
 # Zero download. Zero cold-start delay. Better quality than BGE-base.
@@ -251,12 +251,32 @@ def _make_api() -> YouTubeTranscriptApi:
     Return a YouTubeTranscriptApi instance.
     On Streamlit Cloud, routes requests through PROXY_URL (if set) to bypass
     geo-restrictions.  Locally PROXY_URL is empty so no proxy is used.
+
+    youtube-transcript-api v0.6+ uses ProxyConfig objects, not a raw dict.
+    Supports two formats in PROXY_URL secret:
+      Generic:  http://user:pass@host:port
+      Webshare: webshare://username:password  (uses Webshare rotating proxy pool)
     """
+    from youtube_transcript_api.proxies import GenericProxyConfig, WebshareProxyConfig
+
     if PROXY_URL:
-        # webshare / any HTTP proxy in format http://user:pass@host:port
-        return YouTubeTranscriptApi(
-            proxies={"http": PROXY_URL, "https": PROXY_URL}
-        )
+        if PROXY_URL.startswith("webshare://"):
+            # Format: webshare://username:password
+            creds = PROXY_URL[len("webshare://"):]
+            username, password = creds.split(":", 1)
+            proxy_config = WebshareProxyConfig(
+                proxy_username=username,
+                proxy_password=password,
+                retries_when_blocked=3,
+            )
+        else:
+            # Generic HTTP/HTTPS/SOCKS proxy: http://user:pass@host:port
+            proxy_config = GenericProxyConfig(
+                http_url=PROXY_URL,
+                https_url=PROXY_URL,
+            )
+        return YouTubeTranscriptApi(proxy_config=proxy_config)
+
     return YouTubeTranscriptApi()
 
 
