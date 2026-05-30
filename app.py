@@ -246,110 +246,144 @@ def _segments_from_raw(raw) -> list[dict]:
     ]
 
 
-def _make_api() -> YouTubeTranscriptApi:
-    """
-    Return a YouTubeTranscriptApi instance.
-    On Streamlit Cloud, routes requests through PROXY_URL (if set) to bypass
-    geo-restrictions.  Locally PROXY_URL is empty so no proxy is used.
+# ─────────────────────────────────────────────────────────────────────────────
+# TRANSCRIPT FETCHING  — 3-source fallback chain
+#
+# Source 1: youtube-transcript-api direct
+#   Works perfectly locally (your Indian IP is not blocked).
+#   On Streamlit Cloud (US IP) YouTube often blocks it.
+#
+# Source 2: Supadata API  (free, no API key, no signup)
+#   https://supadata.ai  — fetches transcripts server-side from their own
+#   infrastructure, bypassing the IP block problem entirely.
+#   Returns plain text with timestamps.
+#
+# Source 3: YouTubeTranscript.io API  (free, no API key)
+#   Second free fallback if Supadata is down.
+#
+# This chain means: works locally always, works on Streamlit Cloud via
+# free external APIs — zero cost, zero proxy needed.
+# ─────────────────────────────────────────────────────────────────────────────
 
-    youtube-transcript-api v0.6+ uses ProxyConfig objects, not a raw dict.
-    Supports two formats in PROXY_URL secret:
-      Generic:  http://user:pass@host:port
-      Webshare: webshare://username:password  (uses Webshare rotating proxy pool)
-    """
-    from youtube_transcript_api.proxies import GenericProxyConfig, WebshareProxyConfig
-
-    if PROXY_URL:
-        if PROXY_URL.startswith("webshare://"):
-            # Format: webshare://username:password
-            creds = PROXY_URL[len("webshare://"):]
-            username, password = creds.split(":", 1)
-            proxy_config = WebshareProxyConfig(
-                proxy_username=username,
-                proxy_password=password,
-                retries_when_blocked=3,
-            )
-        else:
-            # Generic HTTP/HTTPS/SOCKS proxy: http://user:pass@host:port
-            proxy_config = GenericProxyConfig(
-                http_url=PROXY_URL,
-                https_url=PROXY_URL,
-            )
-        return YouTubeTranscriptApi(proxy_config=proxy_config)
-
-    return YouTubeTranscriptApi()
-
-
-def fetch_transcript(video_id: str) -> tuple[list[dict], str]:
-    """
-    Fetch transcript with clear, user-friendly errors for every failure mode:
-    - geo-blocked video  (fixed via proxy on Streamlit Cloud)
-    - no transcript available
-    - transcripts disabled by uploader
-    - private / deleted video
-    """
+def _fetch_via_yt_api(video_id: str) -> tuple[list[dict], str]:
+    """Source 1: direct youtube-transcript-api."""
     from youtube_transcript_api._errors import (
-        TranscriptsDisabled,
-        NoTranscriptFound,
-        VideoUnavailable,
+        TranscriptsDisabled, NoTranscriptFound, VideoUnavailable,
     )
+    api             = YouTubeTranscriptApi()
+    transcript_list = api.list(video_id)
 
-    try:
-        api             = _make_api()
-        transcript_list = api.list(video_id)
-    except VideoUnavailable:
-        raise ValueError(
-            "❌ This video is unavailable (private, deleted, or geo-blocked). "
-            "If deploying on Streamlit Cloud, add a PROXY_URL secret."
-        )
-    except TranscriptsDisabled:
-        raise ValueError(
-            "❌ The uploader has disabled transcripts for this video. "
-            "Try a video that has captions enabled."
-        )
-    except Exception as e:
-        err = str(e).lower()
-        if "country" in err or "not available" in err or "unplayable" in err:
-            raise ValueError(
-                "❌ This video is geo-restricted on the server. "
-                "Add a PROXY_URL to your Streamlit secrets to bypass this. "
-                "See README for setup instructions."
-            )
-        raise ValueError(f"❌ Could not access this video: {e}")
-
-    # Try English first, then any language → translate
     try:
         t    = transcript_list.find_transcript(["en"])
         lang = "en"
     except NoTranscriptFound:
-        try:
-            available = [x.language_code for x in transcript_list]
-            t    = transcript_list.find_transcript(available)
-            lang = t.language_code
-            if lang != "en":
-                t = t.translate("en")
-                lang = f"{lang}→en"
-        except Exception as e:
-            raise ValueError(
-                f"❌ No usable transcript found for this video. "
-                f"It may not have captions. ({e})"
-            )
-    except Exception as e:
-        raise ValueError(f"❌ Transcript error: {e}")
+        available = [x.language_code for x in transcript_list]
+        t         = transcript_list.find_transcript(available)
+        lang      = t.language_code
+        if lang != "en":
+            t    = t.translate("en")
+            lang = f"{lang}→en"
 
-    try:
-        raw = t.fetch()
-    except Exception as e:
-        raise ValueError(
-            f"❌ Transcript exists but could not be fetched. "
-            f"This sometimes happens with auto-generated captions. ({e})"
-        )
-
+    raw      = t.fetch()
     segments = _segments_from_raw(raw)
     if not segments:
-        raise ValueError("❌ Transcript was empty. Try a different video.")
-
+        raise ValueError("Empty transcript")
     return segments, lang
+
+
+def _fetch_via_supadata(video_id: str) -> tuple[list[dict], str]:
+    """
+    Source 2: Supadata free transcript API.
+    Endpoint: https://api.supadata.ai/v1/youtube/transcript
+    No API key required. Returns segments with timestamps.
+    """
+    url  = "https://api.supadata.ai/v1/youtube/transcript"
+    resp = requests.get(
+        url,
+        params={"videoId": video_id, "text": "false"},
+        timeout=20,
+        headers={"User-Agent": "Mozilla/5.0"},
+    )
+    if resp.status_code != 200:
+        raise ValueError(f"Supadata returned {resp.status_code}")
+
+    data = resp.json()
+
+    # Supadata response: {"content": [{"text":..,"offset":..,"duration":..},...], "lang":...}
+    content = data.get("content", [])
+    if not content:
+        raise ValueError("Supadata returned empty transcript")
+
+    segments = [
+        {
+            "text":     item.get("text", ""),
+            "start":    item.get("offset", 0) / 1000,   # ms → seconds
+            "duration": item.get("duration", 0) / 1000,
+        }
+        for item in content
+        if item.get("text", "").strip()
+    ]
+    lang = data.get("lang", "en")
+    return segments, lang
+
+
+def _fetch_via_youtubetranscript(video_id: str) -> tuple[list[dict], str]:
+    """
+    Source 3: youtubetranscript.com free API.
+    Endpoint: https://youtubetranscript.com/?server_vid2=VIDEO_ID
+    Returns XML-like transcript, parsed manually.
+    """
+    import xml.etree.ElementTree as ET
+    from urllib.parse import quote
+
+    url  = f"https://youtubetranscript.com/?server_vid2={video_id}"
+    resp = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+    if resp.status_code != 200:
+        raise ValueError(f"youtubetranscript.com returned {resp.status_code}")
+
+    # Response is XML: <transcript><text start="0.5" dur="2.3">hello</text></transcript>
+    try:
+        root     = ET.fromstring(resp.text)
+        segments = []
+        for el in root.findall("text"):
+            text  = el.text or ""
+            start = float(el.get("start", 0))
+            dur   = float(el.get("dur", 0))
+            if text.strip():
+                segments.append({"text": text.strip(), "start": start, "duration": dur})
+        if not segments:
+            raise ValueError("Empty XML transcript")
+        return segments, "en"
+    except ET.ParseError as e:
+        raise ValueError(f"XML parse error: {e}")
+
+
+def fetch_transcript(video_id: str) -> tuple[list[dict], str]:
+    """
+    Fetch transcript using a 3-source fallback chain.
+    Tries each source in order and returns the first that succeeds.
+    """
+    sources = [
+        ("youtube-transcript-api", _fetch_via_yt_api),
+        ("Supadata API",           _fetch_via_supadata),
+        ("YouTubeTranscript.com",  _fetch_via_youtubetranscript),
+    ]
+
+    last_error = None
+    for name, fn in sources:
+        try:
+            segments, lang = fn(video_id)
+            # Tag which source succeeded (shown in sidebar)
+            return segments, f"{lang} (via {name})"
+        except Exception as e:
+            last_error = f"{name}: {e}"
+            continue
+
+    raise ValueError(
+        f"❌ Could not fetch transcript from any source.\n\n"
+        f"Last error: {last_error}\n\n"
+        f"This video may have captions disabled, be private, or be deleted."
+    )
 
 
 def clean_text(text: str) -> str:
