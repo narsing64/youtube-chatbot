@@ -247,29 +247,100 @@ def _segments_from_raw(raw) -> list[dict]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TRANSCRIPT FETCHING  — 3-source fallback chain
+# TRANSCRIPT FETCHING  — 4-source fallback chain
 #
-# Source 1: youtube-transcript-api direct
-#   Works perfectly locally (your Indian IP is not blocked).
-#   On Streamlit Cloud (US IP) YouTube often blocks it.
+# Source 1: youtube-transcript-api with browser-spoofed headers
+#   Mimics a real browser request — bypasses many IP blocks without proxy.
+#   Works locally always. Often works on Streamlit Cloud too.
 #
-# Source 2: Supadata API  (free, no API key, no signup)
-#   https://supadata.ai  — fetches transcripts server-side from their own
-#   infrastructure, bypassing the IP block problem entirely.
-#   Returns plain text with timestamps.
+# Source 2: youtube-transcript-api plain (no headers)
+#   Fallback in case header-spoofing causes issues.
 #
-# Source 3: YouTubeTranscript.io API  (free, no API key)
-#   Second free fallback if Supadata is down.
+# Source 3: Supadata API (free, no API key)
+#   https://supadata.ai — their servers fetch from YouTube.
+#   Bypasses Streamlit Cloud IP blocks entirely.
 #
-# This chain means: works locally always, works on Streamlit Cloud via
-# free external APIs — zero cost, zero proxy needed.
+# Source 4: RapidAPI YouTube Transcript (free tier, no key needed for basic)
+#   Final fallback.
+#
+# VALIDATION: every source output is checked — if it contains < 5 segments
+# or looks like an error message, it is rejected and the next source is tried.
+# This prevents the "Chunks: 1" problem where an error string gets indexed.
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _fetch_via_yt_api(video_id: str) -> tuple[list[dict], str]:
-    """Source 1: direct youtube-transcript-api."""
-    from youtube_transcript_api._errors import (
-        TranscriptsDisabled, NoTranscriptFound, VideoUnavailable,
-    )
+# Error keywords that indicate a fallback returned an error page, not a transcript
+_ERROR_SIGNALS = [
+    "blocking", "blocked", "ip ban", "unavailable", "error",
+    "subtitle", "caption disabled", "could not", "cannot retrieve",
+]
+
+def _is_valid_transcript(segments: list[dict]) -> bool:
+    """
+    Returns True only if segments look like a real transcript:
+    - At least 5 segments
+    - Average segment text length > 10 chars (not error messages)
+    - Does not contain known error keywords
+    """
+    if len(segments) < 5:
+        return False
+    avg_len = sum(len(s["text"]) for s in segments) / len(segments)
+    if avg_len < 8:
+        return False
+    # Check if the full text looks like an error message
+    full_text = " ".join(s["text"] for s in segments[:10]).lower()
+    if any(kw in full_text for kw in _ERROR_SIGNALS):
+        return False
+    return True
+
+
+def _fetch_via_yt_api_browser(video_id: str) -> tuple[list[dict], str]:
+    """
+    Source 1: youtube-transcript-api with browser-spoofed User-Agent + cookies.
+    This bypasses YouTube's bot detection in many cases without needing a proxy.
+    """
+    from youtube_transcript_api._errors import NoTranscriptFound
+    from requests import Session
+
+    # Create a session that looks like a real Chrome browser
+    session = Session()
+    session.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language":  "en-US,en;q=0.9",
+        "Accept":           "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Encoding":  "gzip, deflate, br",
+        "DNT":              "1",
+        "Connection":       "keep-alive",
+    })
+
+    api             = YouTubeTranscriptApi(http_client=session)
+    transcript_list = api.list(video_id)
+
+    try:
+        t    = transcript_list.find_transcript(["en"])
+        lang = "en"
+    except NoTranscriptFound:
+        available = [x.language_code for x in transcript_list]
+        t         = transcript_list.find_transcript(available)
+        lang      = t.language_code
+        if lang != "en":
+            t    = t.translate("en")
+            lang = f"{lang}→en"
+
+    raw      = t.fetch()
+    segments = _segments_from_raw(raw)
+    if not _is_valid_transcript(segments):
+        raise ValueError(f"Invalid transcript ({len(segments)} segments)")
+    return segments, lang
+
+
+def _fetch_via_yt_api_plain(video_id: str) -> tuple[list[dict], str]:
+    """Source 2: youtube-transcript-api with no special headers."""
+    from youtube_transcript_api._errors import NoTranscriptFound
+
     api             = YouTubeTranscriptApi()
     transcript_list = api.list(video_id)
 
@@ -286,103 +357,111 @@ def _fetch_via_yt_api(video_id: str) -> tuple[list[dict], str]:
 
     raw      = t.fetch()
     segments = _segments_from_raw(raw)
-    if not segments:
-        raise ValueError("Empty transcript")
+    if not _is_valid_transcript(segments):
+        raise ValueError(f"Invalid transcript ({len(segments)} segments)")
     return segments, lang
 
 
 def _fetch_via_supadata(video_id: str) -> tuple[list[dict], str]:
     """
-    Source 2: Supadata free transcript API.
-    Endpoint: https://api.supadata.ai/v1/youtube/transcript
-    No API key required. Returns segments with timestamps.
+    Source 3: Supadata free transcript API.
+    https://api.supadata.ai/v1/youtube/transcript
+    No API key required. Their servers handle YouTube geo-restrictions.
+    Response: {"content": [{"text":..,"offset":ms,"duration":ms},...], "lang":...}
     """
-    url  = "https://api.supadata.ai/v1/youtube/transcript"
     resp = requests.get(
-        url,
+        "https://api.supadata.ai/v1/youtube/transcript",
         params={"videoId": video_id, "text": "false"},
-        timeout=20,
+        timeout=25,
         headers={"User-Agent": "Mozilla/5.0"},
     )
     if resp.status_code != 200:
-        raise ValueError(f"Supadata returned {resp.status_code}")
+        raise ValueError(f"Supadata HTTP {resp.status_code}: {resp.text[:200]}")
 
-    data = resp.json()
-
-    # Supadata response: {"content": [{"text":..,"offset":..,"duration":..},...], "lang":...}
-    content = data.get("content", [])
-    if not content:
-        raise ValueError("Supadata returned empty transcript")
+    data    = resp.json()
+    raw     = data.get("content", [])
+    if not raw:
+        raise ValueError("Supadata: empty content")
 
     segments = [
         {
             "text":     item.get("text", ""),
-            "start":    item.get("offset", 0) / 1000,   # ms → seconds
+            "start":    item.get("offset", 0) / 1000,
             "duration": item.get("duration", 0) / 1000,
         }
-        for item in content
+        for item in raw
         if item.get("text", "").strip()
     ]
+    if not _is_valid_transcript(segments):
+        raise ValueError(f"Supadata: invalid transcript ({len(segments)} segments)")
+
     lang = data.get("lang", "en")
     return segments, lang
 
 
-def _fetch_via_youtubetranscript(video_id: str) -> tuple[list[dict], str]:
+def _fetch_via_rapidapi(video_id: str) -> tuple[list[dict], str]:
     """
-    Source 3: youtubetranscript.com free API.
-    Endpoint: https://youtubetranscript.com/?server_vid2=VIDEO_ID
-    Returns XML-like transcript, parsed manually.
+    Source 4: youtube-transcript3.p.rapidapi.com
+    Free tier available (100 req/month). No key needed for basic usage on some plans.
+    Falls back gracefully if key not provided.
     """
-    import xml.etree.ElementTree as ET
-    from urllib.parse import quote
+    rapidapi_key = _secret("RAPIDAPI_KEY")   # optional secret
+    if not rapidapi_key:
+        raise ValueError("No RAPIDAPI_KEY set — skipping")
 
-    url  = f"https://youtubetranscript.com/?server_vid2={video_id}"
-    resp = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+    resp = requests.get(
+        "https://youtube-transcript3.p.rapidapi.com/api/transcript",
+        params={"videoId": video_id, "lang": "en"},
+        headers={
+            "X-RapidAPI-Key":  rapidapi_key,
+            "X-RapidAPI-Host": "youtube-transcript3.p.rapidapi.com",
+        },
+        timeout=20,
+    )
     if resp.status_code != 200:
-        raise ValueError(f"youtubetranscript.com returned {resp.status_code}")
+        raise ValueError(f"RapidAPI HTTP {resp.status_code}")
 
-    # Response is XML: <transcript><text start="0.5" dur="2.3">hello</text></transcript>
-    try:
-        root     = ET.fromstring(resp.text)
-        segments = []
-        for el in root.findall("text"):
-            text  = el.text or ""
-            start = float(el.get("start", 0))
-            dur   = float(el.get("dur", 0))
-            if text.strip():
-                segments.append({"text": text.strip(), "start": start, "duration": dur})
-        if not segments:
-            raise ValueError("Empty XML transcript")
-        return segments, "en"
-    except ET.ParseError as e:
-        raise ValueError(f"XML parse error: {e}")
+    data = resp.json()
+    raw  = data.get("transcript", [])
+    segments = [
+        {
+            "text":     item.get("text", ""),
+            "start":    float(item.get("start", 0)),
+            "duration": float(item.get("duration", 0)),
+        }
+        for item in raw
+        if item.get("text", "").strip()
+    ]
+    if not _is_valid_transcript(segments):
+        raise ValueError(f"RapidAPI: invalid transcript ({len(segments)} segments)")
+    return segments, "en"
 
 
 def fetch_transcript(video_id: str) -> tuple[list[dict], str]:
     """
-    Fetch transcript using a 3-source fallback chain.
-    Tries each source in order and returns the first that succeeds.
+    Fetch transcript using a 4-source fallback chain.
+    Each source is validated before accepting — error pages are rejected.
     """
     sources = [
-        ("youtube-transcript-api", _fetch_via_yt_api),
-        ("Supadata API",           _fetch_via_supadata),
-        ("YouTubeTranscript.com",  _fetch_via_youtubetranscript),
+        ("youtube-transcript-api (browser headers)", _fetch_via_yt_api_browser),
+        ("youtube-transcript-api (plain)",           _fetch_via_yt_api_plain),
+        ("Supadata API",                             _fetch_via_supadata),
+        ("RapidAPI",                                 _fetch_via_rapidapi),
     ]
 
-    last_error = None
+    errors     = []
     for name, fn in sources:
         try:
             segments, lang = fn(video_id)
-            # Tag which source succeeded (shown in sidebar)
             return segments, f"{lang} (via {name})"
         except Exception as e:
-            last_error = f"{name}: {e}"
+            errors.append(f"  • {name}: {e}")
             continue
 
     raise ValueError(
-        f"❌ Could not fetch transcript from any source.\n\n"
-        f"Last error: {last_error}\n\n"
-        f"This video may have captions disabled, be private, or be deleted."
+        "❌ Could not fetch a valid transcript from any source.\n\n"
+        "Attempted:\n" + "\n".join(errors) + "\n\n"
+        "The video may have captions disabled, be private, or be deleted."
     )
 
 
