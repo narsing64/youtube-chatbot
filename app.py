@@ -305,13 +305,6 @@ def _segments_from_raw(raw) -> list[dict]:
                 "duration": float(s.get("duration", s.get("dur", 2.0))),
             })
 
-    # Store first 5 starts in session state for debug display
-    if segs:
-        try:
-            st.session_state["debug_raw_starts"] = [round(s["start"], 2) for s in segs[:5]]
-        except Exception:
-            pass
-
     return segs
 
 
@@ -511,13 +504,6 @@ def _fetch_via_rapidapi(video_id: str) -> tuple[list[dict], str]:
 
     if not raw:
         raise ValueError(f"RapidAPI: could not find transcript in response. Keys: {list(data.keys()) if isinstance(data, dict) else type(data)}")
-
-    # Save first raw item to session state so we can debug the exact keys/values
-    try:
-        st.session_state["debug_raw_item"]   = dict(raw[0]) if raw else {}
-        st.session_state["debug_raw_starts"] = [raw[i].get("start", raw[i].get("offset", "MISSING")) for i in range(min(5, len(raw)))]
-    except Exception:
-        pass
 
     def _parse_start(item: dict) -> float:
         """
@@ -767,7 +753,6 @@ def process_video(url: str, progress_bar, status_text):
         )
         progress_bar.progress(100)
         status_text.text("✅ Loaded from cache!")
-        st.session_state["debug_starts"] = ["(from cache — delete faiss_cache/ to rebuild)"]
         return retriever, video_id, vs.index.ntotal, True, "en (cached)"
 
     status_text.text("📥 Step 1/5 — Fetching transcript…")
@@ -796,11 +781,6 @@ def process_video(url: str, progress_bar, status_text):
     )
     progress_bar.progress(100)
     status_text.text("✅ Done! Ready to chat.")
-
-    # Debug: store first 10 segment timestamps so we can see what came from API
-    first_starts = [round(d.metadata["start"], 1) for d in docs[:10]]
-    st.session_state["debug_starts"] = first_starts
-    st.session_state["debug_total"]  = len(docs)
 
     return retriever, video_id, len(docs), False, lang
 
@@ -938,7 +918,7 @@ with st.sidebar:
                     st.session_state.from_cache    = cached
                     st.session_state.detected_lang = lang
                     st.session_state.show_player   = True
-                    st.session_state.max_ts        = st.session_state.get("max_ts", 0)
+
                     st.rerun()
                 except ValueError as e:
                     prog_bar.empty()
@@ -959,13 +939,7 @@ with st.sidebar:
             "💾 **Cache:** hit" if st.session_state.from_cache
             else "🆕 **Cache:** saved"
         )
-        with st.expander("🔍 Debug timestamps"):
-            st.write("**Raw API first item (keys & values):**")
-            st.write(st.session_state.get("debug_raw_item", "not yet fetched"))
-            st.write("**Raw API first 5 start values:**")
-            st.write(st.session_state.get("debug_raw_starts", "not yet fetched"))
-            st.write("**Chunk starts after full pipeline (first 10):**")
-            st.write(st.session_state.get("debug_starts", "not yet built"))
+
         st.divider()
         if st.button(
             "Hide player" if st.session_state.show_player else "Show player",
