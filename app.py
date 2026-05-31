@@ -401,28 +401,34 @@ def _fetch_via_supadata(video_id: str) -> tuple[list[dict], str]:
 
 def _fetch_via_rapidapi(video_id: str) -> tuple[list[dict], str]:
     """
-    Source 4: youtube-transcript3.p.rapidapi.com
-    Free tier available (100 req/month). No key needed for basic usage on some plans.
-    Falls back gracefully if key not provided.
+    RapidAPI — youtube-transcript3 by solid-api.
+    Free tier: 100 requests/month. No credit card needed.
+    Sign up: https://rapidapi.com/solid-api-solid-api-default/api/youtube-transcript3
+    Add RAPIDAPI_KEY to Streamlit secrets.
     """
-    rapidapi_key = _secret("RAPIDAPI_KEY")   # optional secret
+    rapidapi_key = _secret("RAPIDAPI_KEY")
     if not rapidapi_key:
-        raise ValueError("No RAPIDAPI_KEY set — skipping")
+        raise ValueError("RAPIDAPI_KEY not set in secrets")
 
     resp = requests.get(
-        "https://youtube-transcript3.p.rapidapi.com/api/transcript",
-        params={"videoId": video_id, "lang": "en"},
+        "https://youtube-transcript3.p.rapidapi.com/api/transcript-with-url",
+        params={"url": f"https://www.youtube.com/watch?v={video_id}", "flat_text": "false"},
         headers={
             "X-RapidAPI-Key":  rapidapi_key,
             "X-RapidAPI-Host": "youtube-transcript3.p.rapidapi.com",
         },
-        timeout=20,
+        timeout=25,
     )
     if resp.status_code != 200:
-        raise ValueError(f"RapidAPI HTTP {resp.status_code}")
+        raise ValueError(f"RapidAPI HTTP {resp.status_code}: {resp.text[:200]}")
 
     data = resp.json()
-    raw  = data.get("transcript", [])
+
+    # Response shape: {"transcript": [{"text":..,"start":..,"duration":..}, ...]}
+    raw = data.get("transcript", [])
+    if not raw:
+        raise ValueError("RapidAPI: empty transcript array")
+
     segments = [
         {
             "text":     item.get("text", ""),
@@ -439,17 +445,35 @@ def _fetch_via_rapidapi(video_id: str) -> tuple[list[dict], str]:
 
 def fetch_transcript(video_id: str) -> tuple[list[dict], str]:
     """
-    Fetch transcript using a 4-source fallback chain.
-    Each source is validated before accepting — error pages are rejected.
-    """
-    sources = [
-        ("youtube-transcript-api (browser headers)", _fetch_via_yt_api_browser),
-        ("youtube-transcript-api (plain)",           _fetch_via_yt_api_plain),
-        ("Supadata API",                             _fetch_via_supadata),
-        ("RapidAPI",                                 _fetch_via_rapidapi),
-    ]
+    Smart fallback chain — order depends on environment:
 
-    errors     = []
+    If RAPIDAPI_KEY is set (Streamlit Cloud):
+      1. RapidAPI            ← works on cloud, bypasses IP block
+      2. yt-api browser      ← sometimes works even on cloud
+      3. yt-api plain        ← last attempt
+
+    If no RAPIDAPI_KEY (local):
+      1. yt-api browser      ← works locally always
+      2. yt-api plain        ← fallback
+      3. RapidAPI            ← uses key if somehow set
+    """
+    has_rapidapi = bool(_secret("RAPIDAPI_KEY"))
+
+    if has_rapidapi:
+        # Cloud order: RapidAPI first (reliable), direct API as bonus attempts
+        sources = [
+            ("RapidAPI",                                 _fetch_via_rapidapi),
+            ("youtube-transcript-api (browser headers)", _fetch_via_yt_api_browser),
+            ("youtube-transcript-api (plain)",           _fetch_via_yt_api_plain),
+        ]
+    else:
+        # Local order: direct API first (fast), RapidAPI never called
+        sources = [
+            ("youtube-transcript-api (browser headers)", _fetch_via_yt_api_browser),
+            ("youtube-transcript-api (plain)",           _fetch_via_yt_api_plain),
+        ]
+
+    errors = []
     for name, fn in sources:
         try:
             segments, lang = fn(video_id)
@@ -458,10 +482,21 @@ def fetch_transcript(video_id: str) -> tuple[list[dict], str]:
             errors.append(f"  • {name}: {e}")
             continue
 
+    # Build a helpful error message
+    if not has_rapidapi:
+        tip = (
+            "\n\n💡 To fix on Streamlit Cloud:\n"
+            "1. Sign up free at https://rapidapi.com/solid-api-solid-api-default/api/youtube-transcript3\n"
+            "2. Subscribe to the FREE plan (100 requests/month)\n"
+            "3. Copy your RapidAPI key\n"
+            "4. Add to Streamlit secrets:  RAPIDAPI_KEY = \"your_key_here\""
+        )
+    else:
+        tip = "\n\nYour RAPIDAPI_KEY is set but the request failed. Check the key is valid."
+
     raise ValueError(
-        "❌ Could not fetch a valid transcript from any source.\n\n"
-        "Attempted:\n" + "\n".join(errors) + "\n\n"
-        "The video may have captions disabled, be private, or be deleted."
+        "❌ Could not fetch transcript.\n\n"
+        "Attempted:\n" + "\n".join(errors) + tip
     )
 
 
