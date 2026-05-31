@@ -36,6 +36,10 @@ FAISS_CACHE_DIR = "faiss_cache"
 TOP_K_RETRIEVE  = 15
 TOP_K_RERANK    = 5
 
+# Bump this string whenever the chunking/embedding pipeline changes.
+# Old cached indexes will be ignored and rebuilt automatically.
+CACHE_VERSION = "v3_proportional_timestamps"
+
 # ── Proxy config (Streamlit Cloud only) ──────────────────────────────────────
 # Streamlit Cloud servers are in the US. Some YouTube videos are geo-blocked
 # there even if they work fine locally (India).
@@ -465,19 +469,43 @@ def _fetch_via_rapidapi(video_id: str) -> tuple[list[dict], str]:
 
     data = resp.json()
 
-    # Response shape: {"transcript": [{"text":..,"start":..,"duration":..}, ...]}
-    raw = data.get("transcript", [])
+    # Handle multiple possible response shapes from this API
+    raw = []
+    if isinstance(data, list):
+        raw = data                                    # Shape C: root is list
+    elif isinstance(data, dict):
+        raw = (
+            data.get("transcript")                    # Shape A
+            or data.get("transcripts")
+            or data.get("results")
+            or data.get("data")
+            or []
+        )
+        # Shape B: nested transcript inside results
+        if raw and isinstance(raw[0], dict) and "transcript" in raw[0]:
+            raw = raw[0]["transcript"]
+
     if not raw:
-        raise ValueError("RapidAPI: empty transcript array")
+        raise ValueError(f"RapidAPI: could not find transcript in response. Keys: {list(data.keys()) if isinstance(data, dict) else type(data)}")
+
+    def _parse_start(item: dict) -> float:
+        """Extract start time in seconds — handles offset(ms), start(s), begin(s)."""
+        if "start" in item:
+            return float(item["start"])           # already in seconds
+        if "offset" in item:
+            return float(item["offset"]) / 1000   # milliseconds → seconds
+        if "begin" in item:
+            return float(item["begin"])
+        return 0.0
 
     segments = [
         {
-            "text":     item.get("text", ""),
-            "start":    float(item.get("start", 0)),
-            "duration": float(item.get("duration", 0)),
+            "text":     str(item.get("text", item.get("content", ""))).strip(),
+            "start":    _parse_start(item),
+            "duration": float(item.get("duration", item.get("dur", 2.0))),
         }
         for item in raw
-        if item.get("text", "").strip()
+        if str(item.get("text", item.get("content", ""))).strip()
     ]
     if not _is_valid_transcript(segments):
         raise ValueError(f"RapidAPI: invalid transcript ({len(segments)} segments)")
@@ -666,7 +694,8 @@ def build_documents(chunks: list[dict], video_id: str) -> list[Document]:
 
 
 def build_or_load_vectorstore(docs: list[Document], video_id: str):
-    cache_path = os.path.join(FAISS_CACHE_DIR, video_id)
+    # Version-namespaced cache path — old pipeline caches are automatically ignored
+    cache_path = os.path.join(FAISS_CACHE_DIR, CACHE_VERSION, video_id)
     embeddings = load_embeddings()
     if os.path.exists(cache_path):
         vs = FAISS.load_local(cache_path, embeddings, allow_dangerous_deserialization=True)
@@ -862,6 +891,7 @@ with st.sidebar:
                     st.session_state.from_cache    = cached
                     st.session_state.detected_lang = lang
                     st.session_state.show_player   = True
+                    st.session_state.max_ts        = st.session_state.get("max_ts", 0)
                     st.rerun()
                 except ValueError as e:
                     prog_bar.empty()
@@ -878,6 +908,7 @@ with st.sidebar:
         st.markdown(f"**Video ID:** `{st.session_state.video_id}`")
         st.markdown(f"**Chunks:** {st.session_state.n_chunks}")
         st.markdown(f"**Language:** {st.session_state.detected_lang}")
+        st.markdown(f"**Max timestamp:** {seconds_to_mmss(st.session_state.get('max_ts', 0))}")
         st.markdown(
             "💾 **Cache:** hit" if st.session_state.from_cache
             else "🆕 **Cache:** saved"
