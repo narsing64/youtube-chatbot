@@ -203,7 +203,7 @@ def render_player_with_buttons(video_id: str, sources: list, start_seconds: int 
       * {{ box-sizing: border-box; }}
       body {{
         margin: 0; padding: 0;
-        background: #0e1117;
+        background: transparent;
         font-family: sans-serif;
         overflow-x: hidden;
       }}
@@ -274,7 +274,7 @@ def render_player_with_buttons(video_id: str, sources: list, start_seconds: int 
     </body></html>"""
     # height = 56.25% of iframe width for video + 70px for button row
     # components.html iframe is ~700px wide on desktop → video ~394px tall
-    components.html(html, height=480, scrolling=False)
+    components.html(html, height=720, scrolling=False)
 
 # ─────────────────────────────────────────────
 # TRANSCRIPT PIPELINE
