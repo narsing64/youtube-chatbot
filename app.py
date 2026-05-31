@@ -512,25 +512,41 @@ def _fetch_via_rapidapi(video_id: str) -> tuple[list[dict], str]:
     if not raw:
         raise ValueError(f"RapidAPI: could not find transcript in response. Keys: {list(data.keys()) if isinstance(data, dict) else type(data)}")
 
+    # Save first raw item to session state so we can debug the exact keys/values
+    try:
+        st.session_state["debug_raw_item"]   = dict(raw[0]) if raw else {}
+        st.session_state["debug_raw_starts"] = [raw[i].get("start", raw[i].get("offset", "MISSING")) for i in range(min(5, len(raw)))]
+    except Exception:
+        pass
+
     def _parse_start(item: dict) -> float:
-        """Extract start time in seconds — handles offset(ms), start(s), begin(s)."""
-        if "start" in item:
-            return float(item["start"])           # already in seconds
-        if "offset" in item:
-            return float(item["offset"]) / 1000   # milliseconds → seconds
-        if "begin" in item:
-            return float(item["begin"])
+        """
+        Extract start time in seconds.
+        RapidAPI youtube-transcript3 returns 'start' already in seconds as a float.
+        e.g. {"text": "hello", "start": 3.45, "duration": 1.5}
+        """
+        for key in ("start", "offset", "begin", "startTime", "start_time"):
+            if key in item:
+                val = float(item[key])
+                # If value > 1000 it's likely milliseconds — convert to seconds
+                return val / 1000 if val > 1000 else val
         return 0.0
 
-    segments = [
-        {
-            "text":     str(item.get("text", item.get("content", ""))).strip(),
+    segments = []
+    for item in raw:
+        text = str(item.get("text", item.get("content", item.get("transcript", "")))).strip()
+        if not text:
+            continue
+        segments.append({
+            "text":     text,
             "start":    _parse_start(item),
-            "duration": float(item.get("duration", item.get("dur", 2.0))),
-        }
-        for item in raw
-        if str(item.get("text", item.get("content", ""))).strip()
-    ]
+            "duration": float(item.get("duration", item.get("dur", item.get("durationMs", 2000))) ),
+        })
+
+    # Fix durations that look like milliseconds
+    if segments and segments[0]["duration"] > 100:
+        segments = [{**s, "duration": s["duration"] / 1000} for s in segments]
+
     if not _is_valid_transcript(segments):
         raise ValueError(f"RapidAPI: invalid transcript ({len(segments)} segments)")
     return segments, "en"
@@ -944,9 +960,11 @@ with st.sidebar:
             else "🆕 **Cache:** saved"
         )
         with st.expander("🔍 Debug timestamps"):
-            st.write("**Raw API segments (first 5 starts):**")
+            st.write("**Raw API first item (keys & values):**")
+            st.write(st.session_state.get("debug_raw_item", "not yet fetched"))
+            st.write("**Raw API first 5 start values:**")
             st.write(st.session_state.get("debug_raw_starts", "not yet fetched"))
-            st.write("**Chunk starts after pipeline (first 10):**")
+            st.write("**Chunk starts after full pipeline (first 10):**")
             st.write(st.session_state.get("debug_starts", "not yet built"))
         st.divider()
         if st.button(
