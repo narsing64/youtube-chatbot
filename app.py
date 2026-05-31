@@ -2,6 +2,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 import os
 import re
+import shutil
 
 from youtube_transcript_api import YouTubeTranscriptApi
 from langchain_core.documents import Document
@@ -38,7 +39,7 @@ TOP_K_RERANK    = 5
 
 # Bump this string whenever the chunking/embedding pipeline changes.
 # Old cached indexes will be ignored and rebuilt automatically.
-CACHE_VERSION = "v3_proportional_timestamps"
+CACHE_VERSION = "v4_fixed_timestamps"
 
 # ── Proxy config (Streamlit Cloud only) ──────────────────────────────────────
 # Streamlit Cloud servers are in the US. Some YouTube videos are geo-blocked
@@ -280,15 +281,38 @@ def render_player_with_buttons(video_id: str, sources: list, start_seconds: int 
 # ─────────────────────────────────────────────
 
 def _segments_from_raw(raw) -> list[dict]:
-    """Normalise raw transcript snippets to plain dicts."""
-    return [
-        {
-            "text":     s.text     if hasattr(s, "text")     else s["text"],
-            "start":    s.start    if hasattr(s, "start")    else s["start"],
-            "duration": s.duration if hasattr(s, "duration") else s.get("duration", 0),
-        }
-        for s in raw
-    ]
+    """
+    Normalise a FetchedTranscript (or list of snippets/dicts) to plain dicts.
+    Uses .to_raw_data() when available — guaranteed correct float start times.
+    """
+    # FetchedTranscript object — official method
+    if hasattr(raw, "to_raw_data"):
+        segs = raw.to_raw_data()
+    elif raw and hasattr(raw[0], "start"):
+        # List of FetchedTranscriptSnippet objects
+        segs = [{"text": s.text, "start": float(s.start), "duration": float(s.duration)} for s in raw]
+    else:
+        # Plain dicts from RapidAPI — normalise keys
+        segs = []
+        for s in raw:
+            start = s.get("start", s.get("offset", s.get("begin", 0)))
+            # Convert ms → s if value looks like milliseconds (> 1000 for non-trivial video)
+            if isinstance(start, (int, float)) and start > 1000:
+                start = start / 1000
+            segs.append({
+                "text":     str(s.get("text", s.get("content", ""))).strip(),
+                "start":    float(start),
+                "duration": float(s.get("duration", s.get("dur", 2.0))),
+            })
+
+    # Store first 5 starts in session state for debug display
+    if segs:
+        try:
+            st.session_state["debug_raw_starts"] = [round(s["start"], 2) for s in segs[:5]]
+        except Exception:
+            pass
+
+    return segs
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -727,6 +751,7 @@ def process_video(url: str, progress_bar, status_text):
         )
         progress_bar.progress(100)
         status_text.text("✅ Loaded from cache!")
+        st.session_state["debug_starts"] = ["(from cache — delete faiss_cache/ to rebuild)"]
         return retriever, video_id, vs.index.ntotal, True, "en (cached)"
 
     status_text.text("📥 Step 1/5 — Fetching transcript…")
@@ -755,6 +780,12 @@ def process_video(url: str, progress_bar, status_text):
     )
     progress_bar.progress(100)
     status_text.text("✅ Done! Ready to chat.")
+
+    # Debug: store first 10 segment timestamps so we can see what came from API
+    first_starts = [round(d.metadata["start"], 1) for d in docs[:10]]
+    st.session_state["debug_starts"] = first_starts
+    st.session_state["debug_total"]  = len(docs)
+
     return retriever, video_id, len(docs), False, lang
 
 # ─────────────────────────────────────────────
@@ -908,17 +939,45 @@ with st.sidebar:
         st.markdown(f"**Video ID:** `{st.session_state.video_id}`")
         st.markdown(f"**Chunks:** {st.session_state.n_chunks}")
         st.markdown(f"**Language:** {st.session_state.detected_lang}")
-        st.markdown(f"**Max timestamp:** {seconds_to_mmss(st.session_state.get('max_ts', 0))}")
         st.markdown(
             "💾 **Cache:** hit" if st.session_state.from_cache
             else "🆕 **Cache:** saved"
         )
+        with st.expander("🔍 Debug timestamps"):
+            st.write("**Raw API segments (first 5 starts):**")
+            st.write(st.session_state.get("debug_raw_starts", "not yet fetched"))
+            st.write("**Chunk starts after pipeline (first 10):**")
+            st.write(st.session_state.get("debug_starts", "not yet built"))
         st.divider()
         if st.button(
             "Hide player" if st.session_state.show_player else "Show player",
             use_container_width=True,
         ):
             st.session_state.show_player = not st.session_state.show_player
+            st.rerun()
+
+        if st.button("🗑️ Clear cache & reprocess", use_container_width=True):
+            # Delete the cached FAISS index for this video so it rebuilds fresh
+            vid = st.session_state.video_id
+            for version_dir in [FAISS_CACHE_DIR]:
+                # Remove all versioned cache folders for this video_id
+                if os.path.exists(version_dir):
+                    for vdir in os.listdir(version_dir):
+                        vpath = os.path.join(version_dir, vdir, vid)
+                        if os.path.exists(vpath):
+                            shutil.rmtree(vpath)
+                            st.success(f"Deleted cache: {vpath}")
+            # Also try direct path
+            direct = os.path.join(FAISS_CACHE_DIR, vid)
+            if os.path.exists(direct):
+                shutil.rmtree(direct)
+            # Reset session so user must reprocess
+            st.session_state.retriever    = None
+            st.session_state.video_id     = None
+            st.session_state.messages     = []
+            st.session_state.show_player  = False
+            st.session_state.last_sources = []
+            st.info("Cache cleared. Paste the URL again and click Process.")
             st.rerun()
     else:
         st.caption("No video loaded yet.")
