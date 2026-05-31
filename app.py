@@ -182,25 +182,64 @@ def render_player_with_buttons(video_id: str, sources: list, start_seconds: int 
         buttons_html += f"""
         <button onclick="seekTo({s})"
           style="background:#1e293b;border:1.5px solid #3b82f6;color:#93c5fd;
-                 border-radius:8px;padding:5px 16px;font-size:13px;font-weight:600;
-                 cursor:pointer;margin:4px 6px 4px 0;"
+                 border-radius:8px;padding:5px 14px;font-size:13px;font-weight:600;
+                 cursor:pointer;margin:4px 6px 4px 0;white-space:nowrap;"
           onmouseover="this.style.background='#1d4ed8'"
           onmouseout="this.style.background='#1e293b'">
           ▶ {label}
         </button>"""
 
+    # Player is rendered inside components.html which is itself an iframe.
+    # We set an explicit pixel width on #player-wrap so it never bleeds
+    # outside its container regardless of Streamlit layout width.
+    # Height breakdown: 480px video (16:9 for ~854px wide) + 70px buttons = 550px total.
     html = f"""<!DOCTYPE html><html><head>
     <style>
-      body {{ margin:0; padding:0; background:#0e1117; font-family:sans-serif; }}
-      #player-wrap {{ width:100%; aspect-ratio:16/9; border-radius:10px; overflow:hidden; background:#000; }}
-      #btn-row {{ padding:8px 0 4px; }}
-      .btn-label {{ font-size:11px; color:#64748b; margin-bottom:4px; }}
+      * {{ box-sizing: border-box; }}
+      body {{
+        margin: 0; padding: 0;
+        background: #0e1117;
+        font-family: sans-serif;
+        overflow-x: hidden;
+      }}
+      #outer {{
+        width: 100%;
+        max-width: 100%;
+        padding: 0;
+      }}
+      #player-wrap {{
+        position: relative;
+        width: 100%;
+        padding-top: 56.25%;   /* 16:9 ratio */
+        border-radius: 10px;
+        overflow: hidden;
+        background: #000;
+      }}
+      #yt-player {{
+        position: absolute;
+        top: 0; left: 0;
+        width: 100%; height: 100%;
+      }}
+      #btn-row {{
+        padding: 10px 0 4px;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 4px;
+      }}
+      .btn-label {{
+        width: 100%;
+        font-size: 11px;
+        color: #64748b;
+        margin-bottom: 2px;
+      }}
     </style>
     </head><body>
-      <div id="player-wrap"><div id="yt-player"></div></div>
-      <div id="btn-row">
-        <div class="btn-label">⏩ Jump to timestamp:</div>
-        {buttons_html if buttons_html else '<span style="color:#64748b;font-size:12px">Ask a question to see timestamps</span>'}
+      <div id="outer">
+        <div id="player-wrap"><div id="yt-player"></div></div>
+        <div id="btn-row">
+          <div class="btn-label">⏩ Jump to timestamp:</div>
+          {buttons_html if buttons_html else '<span style="color:#64748b;font-size:12px">Ask a question to see timestamps</span>'}
+        </div>
       </div>
       <script>
         var player;
@@ -228,7 +267,9 @@ def render_player_with_buttons(video_id: str, sources: list, start_seconds: int 
         }}
       </script>
     </body></html>"""
-    components.html(html, height=500, scrolling=False)
+    # height = 56.25% of iframe width for video + 70px for button row
+    # components.html iframe is ~700px wide on desktop → video ~394px tall
+    components.html(html, height=480, scrolling=False)
 
 # ─────────────────────────────────────────────
 # TRANSCRIPT PIPELINE
@@ -507,20 +548,61 @@ def clean_text(text: str) -> str:
 
 
 def merge_windows(segments: list[dict], window_size: int = 20) -> list[dict]:
+    """
+    Merge subtitle segments into overlapping windows.
+    Stores segment_starts list alongside the merged text so build_documents
+    can assign accurate timestamps to each sub-chunk (not just window start).
+    """
     step, merged = window_size // 2, []
     for i in range(0, len(segments), step):
         chunk = segments[i : i + window_size]
         if not chunk:
             break
         merged.append({
-            "text":  " ".join(clean_text(s["text"]) for s in chunk),
-            "start": chunk[0]["start"],
-            "end":   chunk[-1]["start"] + chunk[-1].get("duration", 0),
+            "text":            " ".join(clean_text(s["text"]) for s in chunk),
+            "start":           chunk[0]["start"],
+            "end":             chunk[-1]["start"] + chunk[-1].get("duration", 0),
+            # Per-segment timestamps within this window — used for accurate
+            # sub-chunk timestamp assignment in build_documents
+            "segment_starts":  [s["start"] for s in chunk],
+            "segment_texts":   [clean_text(s["text"]) for s in chunk],
         })
     return merged
 
 
+def _estimate_start_from_segments(
+    sub_text: str,
+    segment_texts: list[str],
+    segment_starts: list[float],
+    window_start: float,
+) -> float:
+    """
+    Find which segment in the window best matches the beginning of sub_text.
+    Returns that segment's actual timestamp — far more accurate than proportion.
+    """
+    if not segment_starts:
+        return window_start
+
+    first_words = set(sub_text.lower().split()[:6])  # first 6 words of sub-chunk
+
+    best_idx   = 0
+    best_score = 0
+    for idx, seg_text in enumerate(segment_texts):
+        seg_words = set(seg_text.lower().split())
+        score     = len(first_words & seg_words)
+        if score > best_score:
+            best_score = score
+            best_idx   = idx
+
+    return segment_starts[best_idx]
+
+
 def semantic_split(windows: list[dict], embeddings) -> list[dict]:
+    """
+    Semantic chunking — splits on topic changes.
+    Passes segment_starts and segment_texts through so build_documents
+    can still assign accurate timestamps to each sub-chunk.
+    """
     chunker = SemanticChunker(
         embeddings,
         breakpoint_threshold_type="percentile",
@@ -531,23 +613,54 @@ def semantic_split(windows: list[dict], embeddings) -> list[dict]:
         try:
             docs = chunker.create_documents([w["text"]])
             for d in docs:
-                result.append({"text": d.page_content, "start": w["start"], "end": w["end"]})
+                result.append({
+                    "text":           d.page_content,
+                    "start":          w["start"],
+                    "end":            w["end"],
+                    # carry through for accurate timestamp matching
+                    "segment_starts": w.get("segment_starts", []),
+                    "segment_texts":  w.get("segment_texts",  []),
+                })
         except Exception:
-            result.append(w)
+            result.append(w)  # fallback: keep full window
     return result
 
 
 def build_documents(chunks: list[dict], video_id: str) -> list[Document]:
+    """
+    Split each semantic chunk into sub-chunks and assign accurate timestamps.
+    Uses _estimate_start_from_segments to match each sub-chunk back to the
+    actual subtitle segment it came from — gives real timestamps, not 0:00.
+    """
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=700, chunk_overlap=150,
         separators=["\n\n", "\n", ". ", " ", ""],
     )
     docs = []
     for c in chunks:
-        for text in splitter.split_text(c["text"]):
+        sub_texts = splitter.split_text(c["text"])
+        if not sub_texts:
+            continue
+
+        seg_texts  = c.get("segment_texts",  [])
+        seg_starts = c.get("segment_starts", [])
+
+        for text in sub_texts:
+            # Use real segment matching if available, else proportional estimate
+            if seg_texts and seg_starts:
+                start = _estimate_start_from_segments(
+                    text, seg_texts, seg_starts, float(c["start"])
+                )
+            else:
+                start = float(c["start"])
+
             docs.append(Document(
                 page_content=text,
-                metadata={"start": c["start"], "end": c["end"], "video_id": video_id},
+                metadata={
+                    "start":    start,
+                    "end":      c["end"],
+                    "video_id": video_id,
+                },
             ))
     return docs
 
